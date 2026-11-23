@@ -1,26 +1,35 @@
 #![no_std]
-//! `KovaraIndex` — daily Kōvara Value Index (KVI) records, one per country
-//! per day.
+//! Kōvara smart contracts — PriceVault and KovaraIndex.
 //!
-//! This crate currently carries the minimum surface needed by **CT-035**
-//! (complete daily index events) and **CT-036** (contract storage
-//! versioning). The rest of the index behaviour is owned by other issues and
-//! will extend what is here rather than replace it:
+//! # PriceVault (CT-002, CT-003, CT-004, CT-005)
+//!
+//! Stores raw price submissions on-ledger. The entry point for all price
+//! submissions. Stores unverified prices and emits events consumed by the
+//! `@kovara/sentinel` oracle daemon.
+//!
+//! | Issue | Description |
+//! |---|---|
+//! | CT-002 | Implement PriceVault contract |
+//! | CT-003 | Key price submissions deterministically |
+//! | CT-004 | Validate countries and categories |
+//! | CT-005 | Reject invalid price values |
+//!
+//! # KovaraIndex (CT-030 through CT-037)
+//!
+//! Daily Kōvara Value Index (KVI) records, one per country per day.
+//! The full **CT-030..CT-037** series for the daily index lands in this
+//! crate:
 //!
 //! | Issue | Adds |
 //! |---|---|
-//! | CT-030 | Daily index storage semantics beyond the single record below |
-//! | CT-031 | KVI rounding rules for `value` |
-//! | CT-032 | Deterministic aggregation producing `value` |
-//! | CT-033 | Rejection of duplicate index updates |
+//! | CT-030 | Daily storage: one immutable record per country/day, plus `latest` and range queries |
+//! | CT-031 | Fixed-point scale, rounding, overflow bounds, missing-basket and baseline rules for `value` |
+//! | CT-032 | Deterministic weighted trimmed-median aggregation producing `value` |
+//! | CT-033 | Rejection of duplicate and out-of-order updates — finalized history is immutable |
 //! | CT-034 | The authorization policy for who may update |
-//!
-//! Deliberately **not** implemented here: rounding, aggregation, duplicate
-//! rejection, and the authorization policy. `set_daily_index` therefore
-//! accepts a value that some other component computed, requires only that the
-//! named updater signed for itself, and allows a later write to replace an
-//! earlier one. Each of those is a named issue above, and guessing at their
-//! semantics now would only have to be undone.
+//! | CT-035 | The complete daily index event |
+//! | CT-036 | Storage versioning |
+//! | CT-037 | Admin transfer and recovery |
 //!
 //! # Storage versioning (CT-036)
 //!
@@ -46,8 +55,29 @@ use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, Symbol, Vec,
 };
 
+pub mod price_vault;
+
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod history;
+
+#[cfg(test)]
+mod storage_version;
+
+#[cfg(test)]
+mod publication_events;
+
+#[cfg(test)]
+mod previous_day;
+
+#[cfg(test)]
+mod authorization;
+
+#[cfg(test)]
+mod category_coverage;
+mod price_vault_test;
 
 /// The storage schema this build of the contract understands.
 ///
@@ -56,6 +86,52 @@ mod test;
 /// then rejects every operation until it is migrated, which is the intended
 /// outcome — the alternative is reading a v1 record as though it were v2.
 pub const SCHEMA_VERSION: u32 = 1;
+
+// ── CT-031: the fixed-point representation of `value` ────────────────────
+
+/// The fixed-point scale every KVI `value` is expressed in.
+///
+/// Stored values are integers; dividing by [`KVI_SCALE`] yields the
+/// human-readable index. One scale, everywhere, is what makes two
+/// implementations of the aggregation produce numbers a consumer can compare.
+pub const KVI_SCALE: i128 = 10_000;
+
+/// The baseline index value: 100.0000 in [`KVI_SCALE`] units.
+///
+/// KVI is normalized so that a country's reference period reads as
+/// [`KVI_BASELINE`]: a value above it means prices moved up relative to that
+/// baseline, below it means they moved down. The contract stores absolute
+/// values and does not re-normalize; this constant pins what "parity with the
+/// baseline" means for every consumer of the data.
+pub const KVI_BASELINE: i128 = 100 * KVI_SCALE;
+
+/// The largest absolute `value` the contract will store.
+///
+/// This is the overflow rule (CT-031). Bounding stored and aggregated values
+/// at 10^18 keeps every arithmetic step in the contract — including the
+/// half-away-from-zero rounding of two medians — far inside `i128`, so a
+/// value can never wrap silently. Values beyond the bound are rejected with
+/// [`Error::ValueOutOfRange`].
+pub const KVI_VALUE_MAX: i128 = 1_000_000_000_000_000_000;
+
+// ── CT-032: deterministic aggregation ────────────────────────────────────
+
+/// How much of each end of the observation distribution is trimmed before
+/// the median is taken, in percent (CT-032).
+///
+/// A 10% trim drops the lowest and highest `len * TRIMMING_PERCENT / 100`
+/// observations (floored). The percentage, not a fixed count, is what keeps
+/// the behaviour stable as the observation count grows.
+pub const TRIMMING_PERCENT: u32 = 10;
+
+// ── CT-030: range queries ────────────────────────────────────────────────
+
+/// The widest `daily_index_history` range, in days.
+///
+/// A range query iterates one storage read per day, so the window must be
+/// bounded or a caller could make the contract spin. Ten years is far wider
+/// than any real use and still cheap.
+pub const MAX_HISTORY_WINDOW: u64 = 3660;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -126,6 +202,50 @@ pub enum Error {
 
     /// The proposed admin is already the current admin.
     AlreadyAdmin = 20,
+
+    // ── CT-042: category-level aggregation ───────────────────────────────
+    /// An empty category list was supplied.
+    EmptyCategoryList = 21,
+
+    /// The category list exceeds the maximum allowed length.
+    CategoryListTooLong = 22,
+
+    /// An empty category symbol (zero-length) was supplied.
+    InvalidCategory = 23,
+
+    // ── CT-047: previous-day lookup ──────────────────────────────────────
+    /// No prior daily index was found within the allowed look-back window.
+    NoPreviousDay = 24,
+
+    // ── CT-049: history pagination ───────────────────────────────────────
+    /// The page cursor is out of range for this country's history.
+    InvalidCursor = 25,
+    // ── CT-030: daily storage and queries ─────────────────────────────────
+    /// A `daily_index_history` range wider than [`MAX_HISTORY_WINDOW`] days.
+    HistoryWindowTooLarge = 21,
+
+    /// A range whose end precedes its start.
+    InvalidHistoryRange = 22,
+
+    // ── CT-031: KVI rounding rules ────────────────────────────────────────
+    /// A `value` outside [`KVI_VALUE_MAX`]. This is the overflow rule.
+    ValueOutOfRange = 23,
+
+    // ── CT-032: deterministic aggregation ─────────────────────────────────
+    /// Aggregation called with no observations.
+    EmptyObservations = 24,
+
+    /// An observation with zero weight.
+    ZeroWeight = 25,
+
+    // ── CT-033: immutable history ─────────────────────────────────────────
+    /// A record already exists for this `(country, date)`. Finalized history
+    /// cannot be overwritten.
+    IndexAlreadyFinalized = 26,
+
+    /// A `date` at or before the latest finalized date for the country.
+    /// History moves strictly forward; backdating is rejected.
+    OutOfOrderUpdate = 27,
 }
 
 #[contracttype]
@@ -143,6 +263,13 @@ pub enum DataKey {
     /// different schemas never collide.
     DailyIndex(u32, Symbol, u64),
 
+    /// Persistent: `(schema_version, country)` → the latest finalized date
+    /// for that country.
+    ///
+    /// Feeds the CT-033 out-of-order check: once a later day is finalized,
+    /// writing any earlier day is rejected.
+    LatestDate(u32, Symbol),
+
     /// Instance: the addresses permitted to sign a daily index update.
     Sentinels,
 
@@ -154,6 +281,23 @@ pub enum DataKey {
 
     /// Instance: an in-flight sentinel-initiated admin recovery.
     PendingRecovery,
+
+    // ── CT-049: history pagination ───────────────────────────────────────
+    /// Persistent: `(schema_version, country)` → ordered `Vec<u64>` of dates.
+    ///
+    /// Acts as an index so `get_history` can return stable cursor-based pages
+    /// without scanning all persistent storage.
+    DateIndex(u32, Symbol),
+
+    // ── CT-050: versioned storage key variants ───────────────────────────
+    /// Persistent: versioned daily index keyed as `(schema_version, country, date)`.
+    ///
+    /// Identical semantics to [`DataKey::DailyIndex`] but uses an explicit
+    /// enum variant name so future schemas can be distinguished without
+    /// relying on the leading `u32` alone.  Both variants coexist: existing
+    /// `DailyIndex` reads continue to work; new code may use
+    /// `DailyIndexV` with the same `(SCHEMA_VERSION, country, date)` tuple.
+    DailyIndexV(u32, Symbol, u64),
 }
 
 /// One country's index value for one day.
@@ -166,10 +310,11 @@ pub struct DailyIndex {
     /// The day this index describes, as days since the Unix epoch.
     pub date: u64,
 
-    /// The index value, in the contract's fixed-point representation.
+    /// The index value, in the contract's fixed-point representation
+    /// ([`KVI_SCALE`], bounded by [`KVI_VALUE_MAX`]).
     ///
     /// CT-031 defines the rounding rules that produce this; CT-032 defines
-    /// the aggregation. This crate stores whatever it is given.
+    /// the aggregation.
     pub value: i128,
 
     /// Which basket definition the value was computed against.
@@ -189,6 +334,42 @@ pub struct DailyIndex {
 
     /// The schema version in force when the record was written.
     pub schema_version: u32,
+
+    /// Categories that contributed to this daily value (CT-042).
+    ///
+    /// Each entry is a short symbol identifying an aggregation category
+    /// (e.g. `"food"`, `"fuel"`, `"housing"`). The list is bounded by
+    /// [`MAX_CATEGORIES`] and must be non-empty. Storing the category
+    /// coverage lets consumers inspect aggregation breadth without
+    /// re-deriving it from raw observations.
+    pub categories: Vec<Symbol>,
+}
+
+/// Maximum number of categories that may be attached to a daily index record
+/// (CT-042).
+///
+/// Chosen to stay comfortably within Soroban's per-entry storage limits while
+/// allowing enough coverage signals for practical aggregation auditing.
+pub const MAX_CATEGORIES: u32 = 32;
+
+/// Emitted whenever a daily index record is written (CT-035 / CT-048).
+/// One input to the deterministic daily aggregation (CT-032).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Observation {
+    /// A verified price or price-basket aggregate, in [`KVI_SCALE`] units.
+    ///
+    /// Values outside [`KVI_VALUE_MAX`] are rejected by the aggregation,
+    /// matching the storage rule, so the pure function is total over its
+    /// documented domain.
+    pub value: i128,
+
+    /// How many verified submissions this observation represents.
+    ///
+    /// Zero is rejected: an observation that contributes nothing must be
+    /// omitted, not passed as zero, or a caller could silently deflate the
+    /// median.
+    pub weight: u32,
 }
 
 /// Emitted whenever a daily index record is written (CT-035).
@@ -201,6 +382,9 @@ pub struct DailyIndex {
 /// `schema_version` rides along so a consumer can tell which storage schema
 /// produced the record, which matters the moment a migration is in progress
 /// and both schemas are briefly live.
+///
+/// `categories` (CT-042) lists which aggregation categories contributed to
+/// the value, enabling coverage inspection without re-reading raw state.
 #[contractevent]
 #[derive(Clone)]
 pub struct DailyIndexUpdated {
@@ -216,6 +400,7 @@ pub struct DailyIndexUpdated {
     pub source_period_end: u64,
     pub updater: Address,
     pub schema_version: u32,
+    pub categories: Vec<Symbol>,
 }
 
 /// How long a sentinel-initiated admin recovery waits before it can be
@@ -327,6 +512,24 @@ pub struct AdminRecoveryCancelled {
     pub cancelled_new_admin: Address,
 }
 
+/// Maximum number of dates returned in a single history page (CT-049).
+pub const MAX_PAGE_SIZE: u32 = 30;
+
+/// Maximum number of days to look back when searching for a previous-day
+/// record (CT-047).
+pub const MAX_LOOKBACK_DAYS: u64 = 90;
+
+/// A single page of history results returned by [`KovaraIndex::get_history`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryPage {
+    /// Dates in ascending order for this page.
+    pub dates: Vec<u64>,
+    /// Cursor to pass to the next `get_history` call, or `None` if this is
+    /// the last page.
+    pub next_cursor: Option<u32>,
+}
+
 #[contract]
 pub struct KovaraIndex;
 
@@ -393,6 +596,14 @@ impl KovaraIndex {
     /// record's and the event's `updater` field, preserving CT-035's event
     /// shape.
     ///
+    /// **Category coverage (CT-042).** `categories` names which aggregation
+    /// categories contributed to `value`. It must be non-empty and at most
+    /// [`MAX_CATEGORIES`] long; each entry must be a non-empty symbol.
+    /// **Immutable history (CT-033).** A `(country, date)` record is written
+    /// at most once. Replaying this call — or submitting for a date at or
+    /// before the country's latest finalized date — fails, so finalized
+    /// history can never be overwritten or backdated.
+    ///
     /// # Errors
     /// * `NotInitialized` — the contract has no schema version yet
     /// * `IncompatibleSchema` — stored schema differs from [`SCHEMA_VERSION`]
@@ -402,6 +613,11 @@ impl KovaraIndex {
     /// * `InsufficientSignatures` — fewer signers than the threshold
     /// * `InvalidBasketVersion` — `basket_version` is zero
     /// * `InvalidSourcePeriod` — the period ends before it starts
+    /// * `EmptyCategoryList` — `categories` is empty
+    /// * `CategoryListTooLong` — `categories` exceeds [`MAX_CATEGORIES`]
+    /// * `ValueOutOfRange` — `value` is outside [`KVI_VALUE_MAX`] (CT-031)
+    /// * `IndexAlreadyFinalized` — the date already has a record (CT-033)
+    /// * `OutOfOrderUpdate` — the date is not after the latest one (CT-033)
     #[allow(clippy::too_many_arguments)]
     pub fn set_daily_index(
         env: Env,
@@ -412,6 +628,7 @@ impl KovaraIndex {
         basket_version: u32,
         source_period_start: u64,
         source_period_end: u64,
+        categories: Vec<Symbol>,
     ) -> Result<(), Error> {
         let schema_version = Self::require_compatible_schema(&env)?;
 
@@ -427,8 +644,21 @@ impl KovaraIndex {
             return Err(Error::InvalidSourcePeriod);
         }
 
+        // CT-042: validate category list.
+        if categories.is_empty() {
+            return Err(Error::EmptyCategoryList);
+        }
+        if categories.len() > MAX_CATEGORIES {
+            return Err(Error::CategoryListTooLong);
+        }
+
         let record = DailyIndex {
             country: country.clone(),
+        Self::store_index(
+            &env,
+            schema_version,
+            &updater,
+            &country,
             date,
             value,
             basket_version,
@@ -436,15 +666,76 @@ impl KovaraIndex {
             source_period_end,
             updater: updater.clone(),
             schema_version,
+            categories: categories.clone(),
         };
+        )
+    }
 
-        env.storage().persistent().set(
-            &DataKey::DailyIndex(schema_version, country.clone(), date),
-            &record,
-        );
+    /// Compute and store the daily index from raw observations (CT-032).
+    ///
+    /// The value is produced by [`Self::compute_daily_index`] — the same
+    /// deterministic weighted trimmed median every sentinel can reproduce —
+    /// and then stored and emitted exactly as [`Self::set_daily_index`]
+    /// would. Returns the computed value so the caller need not read it back.
+    ///
+    /// Authorization, field validation, rounding bounds and immutable-history
+    /// rules are all shared with [`Self::set_daily_index`].
+    ///
+    /// # Errors
+    /// As [`Self::set_daily_index`], plus:
+    /// * `EmptyObservations` — `observations` is empty (CT-032)
+    /// * `ZeroWeight` — an observation has weight zero (CT-032)
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_aggregated_index(
+        env: Env,
+        signers: Vec<Address>,
+        country: Symbol,
+        date: u64,
+        observations: Vec<Observation>,
+        basket_version: u32,
+        source_period_start: u64,
+        source_period_end: u64,
+    ) -> Result<i128, Error> {
+        let schema_version = Self::require_compatible_schema(&env)?;
+
+        // CT-049: maintain a date index for history pagination.
+        let date_key = DataKey::DateIndex(schema_version, country.clone());
+        let mut dates: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&date_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if !dates.contains(&date) {
+            dates.push_back(date);
+            // Keep dates in ascending order for stable cursor semantics.
+            // Simple insertion sort is fine: the list is short and appends are
+            // the common case (dates arrive in order).
+            let len = dates.len();
+            if len > 1 {
+                let mut i = len - 1;
+                while i > 0 && dates.get(i - 1).unwrap() > dates.get(i).unwrap() {
+                    let a = dates.get(i - 1).unwrap();
+                    let b = dates.get(i).unwrap();
+                    dates.set(i - 1, b);
+                    dates.set(i, a);
+                    i -= 1;
+                }
+            }
+            env.storage().persistent().set(&date_key, &dates);
+        }
 
         DailyIndexUpdated {
             country,
+        let updater = Self::require_sentinel_quorum(&env, &signers)?;
+
+        let value = Self::aggregate(&observations)?;
+
+        Self::store_index(
+            &env,
+            schema_version,
+            &updater,
+            &country,
             date,
             value,
             basket_version,
@@ -452,10 +743,42 @@ impl KovaraIndex {
             source_period_end,
             updater,
             schema_version,
+            categories,
         }
         .publish(&env);
+        )?;
 
-        Ok(())
+        Ok(value)
+    }
+
+    /// The deterministic daily aggregation (CT-032): a weighted, 10%-trimmed
+    /// median of `observations`.
+    ///
+    /// Pure and stateless, so it needs no authorization and touches no
+    /// storage: any sentinel (or anyone else) can call it to verify that a
+    /// submitted aggregate really is the median of the observations, and
+    /// every caller computing over identical inputs gets the identical
+    /// number.
+    ///
+    /// # Semantics
+    /// * **Trim.** The lowest and highest `len * 10 / 100` observations are
+    ///   dropped before the median is taken.
+    /// * **Median.** The weighted median of the remainder: the first value
+    ///   whose cumulative weight exceeds half the total. When cumulative
+    ///   weight lands exactly on half, the two straddling values are
+    ///   averaged and rounded half away from zero (CT-031).
+    /// * **Weighting.** Each observation counts `weight` times; a heavier
+    ///   observation pulls the median toward itself.
+    /// * **Ties.** Equal values are interchangeable and the sort is by value
+    ///   alone, so the result depends only on the multiset of
+    ///   `(value, weight)` pairs — never on input order.
+    ///
+    /// # Errors
+    /// * `EmptyObservations` — `observations` is empty
+    /// * `ZeroWeight` — an observation has weight zero
+    /// * `ValueOutOfRange` — an observation value is outside [`KVI_VALUE_MAX`]
+    pub fn compute_daily_index(_env: Env, observations: Vec<Observation>) -> Result<i128, Error> {
+        Self::aggregate(&observations)
     }
 
     /// Read a daily index record.
@@ -475,6 +798,211 @@ impl KovaraIndex {
             .storage()
             .persistent()
             .get(&DataKey::DailyIndex(schema_version, country, date)))
+    }
+
+    /// Read a daily index record via the versioned key variant (CT-050).
+    ///
+    /// Identical to [`get_daily_index`] but uses [`DataKey::DailyIndexV`],
+    /// the explicitly named versioned variant introduced by CT-050.  Both
+    /// variants share the same `(schema_version, country, date)` tuple, so a
+    /// record written via `set_daily_index` (which uses `DailyIndex`) is
+    /// readable here through `DailyIndexV` only after it has been written
+    /// under that variant.  This method exists so callers can opt into the
+    /// explicit variant name and tests can verify the two keyspaces are truly
+    /// disjoint.
+    ///
+    /// # Errors
+    /// * `NotInitialized` / `IncompatibleSchema`
+    pub fn get_daily_index_v(
+        env: Env,
+        country: Symbol,
+        date: u64,
+    ) -> Result<Option<DailyIndex>, Error> {
+        let schema_version = Self::require_compatible_schema(&env)?;
+
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::DailyIndexV(schema_version, country, date)))
+    }
+
+    /// Return a capped, cursor-based page of daily dates for a country
+    /// (CT-049).
+    ///
+    /// Dates are returned in ascending order. `cursor` is the zero-based
+    /// position in the full ordered date list from which to start; passing
+    /// `None` starts from the beginning. At most [`MAX_PAGE_SIZE`] dates are
+    /// returned per call.
+    ///
+    /// A cursor points *into* the date list, not at a specific date value.
+    /// This makes it stable: inserting a date before the cursor shifts the
+    /// slice content but the cursor itself still identifies a deterministic
+    /// position.
+    ///
+    /// Returns a [`HistoryPage`] with dates and an optional `next_cursor`;
+    /// `next_cursor` is `None` when the end of the list has been reached.
+    ///
+    /// # Errors
+    /// * `NotInitialized` / `IncompatibleSchema`
+    /// * `InvalidCursor` — `cursor` is beyond the end of the date list
+    pub fn get_history(
+        env: Env,
+        country: Symbol,
+        cursor: Option<u32>,
+    ) -> Result<HistoryPage, Error> {
+        let schema_version = Self::require_compatible_schema(&env)?;
+
+        let dates: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DateIndex(schema_version, country))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let start = cursor.unwrap_or(0);
+
+        if start > 0 && start as u64 >= dates.len() as u64 {
+            return Err(Error::InvalidCursor);
+        }
+
+        let page_size = MAX_PAGE_SIZE;
+        let mut page = Vec::new(&env);
+
+        for i in start..start.saturating_add(page_size) {
+            match dates.get(i) {
+                Some(d) => page.push_back(d),
+                None => break,
+            }
+        }
+
+        let next = if start.saturating_add(page_size) < dates.len() {
+            Some(start + page_size)
+        } else {
+            None
+        };
+
+        Ok(HistoryPage {
+            dates: page,
+            next_cursor: next,
+        })
+    }
+
+    /// Look up the most recent prior daily index for `country` before `date`
+    /// (CT-047).
+    ///
+    /// Scans backward from `date - 1` for up to [`MAX_LOOKBACK_DAYS`] days.
+    /// Returns the first record found, or `Err(Error::NoPreviousDay)` if
+    /// no record exists within the search window.
+    ///
+    /// The bounded window prevents the scan from becoming arbitrarily
+    /// expensive when a country has sparse data.
+    ///
+    /// # Errors
+    /// * `NotInitialized` / `IncompatibleSchema`
+    /// * `NoPreviousDay` — no record found within the look-back window
+    pub fn get_previous_day(
+        env: Env,
+        country: Symbol,
+        date: u64,
+    ) -> Result<DailyIndex, Error> {
+        let schema_version = Self::require_compatible_schema(&env)?;
+
+        let limit = MAX_LOOKBACK_DAYS;
+        let floor = date.saturating_sub(limit);
+
+        // date == 0 means there cannot be a prior day at all.
+        if date == 0 {
+            return Err(Error::NoPreviousDay);
+        }
+
+        let mut probe = date - 1;
+
+        loop {
+            if let Some(record) = env.storage().persistent().get::<DataKey, DailyIndex>(
+                &DataKey::DailyIndex(schema_version, country.clone(), probe),
+            ) {
+                return Ok(record);
+            }
+
+            if probe == floor {
+                break;
+            }
+
+            probe -= 1;
+        }
+
+        Err(Error::NoPreviousDay)
+    /// The most recent finalized index for a country (CT-030).
+    ///
+    /// `None` if the country has no records yet. Uses the per-country latest
+    /// date maintained by the CT-033 out-of-order check, so it is a single
+    /// read rather than a scan.
+    ///
+    /// # Errors
+    /// * `NotInitialized` / `IncompatibleSchema` — as for reads above
+    pub fn latest_daily_index(env: Env, country: Symbol) -> Result<Option<DailyIndex>, Error> {
+        let schema_version = Self::require_compatible_schema(&env)?;
+
+        let latest: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LatestDate(schema_version, country.clone()));
+
+        let latest = match latest {
+            Some(date) => date,
+            None => return Ok(None),
+        };
+
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::DailyIndex(schema_version, country, latest)))
+    }
+
+    /// All finalized records for a country whose `date` is in `[from, to]`,
+    /// ascending (CT-030).
+    ///
+    /// The window is bounded by [`MAX_HISTORY_WINDOW`] so the query cannot
+    /// be weaponized into an unbounded loop.
+    ///
+    /// # Errors
+    /// * `NotInitialized` / `IncompatibleSchema` — as for reads above
+    /// * `InvalidHistoryRange` — `to < from`
+    /// * `HistoryWindowTooLarge` — `to - from` exceeds [`MAX_HISTORY_WINDOW`]
+    pub fn daily_index_history(
+        env: Env,
+        country: Symbol,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<DailyIndex>, Error> {
+        let schema_version = Self::require_compatible_schema(&env)?;
+
+        if to < from {
+            return Err(Error::InvalidHistoryRange);
+        }
+
+        if to - from > MAX_HISTORY_WINDOW {
+            return Err(Error::HistoryWindowTooLarge);
+        }
+
+        let mut records = Vec::new(&env);
+        let mut date = from;
+
+        while date <= to {
+            if let Some(record) =
+                env.storage()
+                    .persistent()
+                    .get::<DataKey, DailyIndex>(&DataKey::DailyIndex(
+                        schema_version,
+                        country.clone(),
+                        date,
+                    ))
+            {
+                records.push_back(record);
+            }
+            date += 1;
+        }
+
+        Ok(records)
     }
 
     // ── CT-034: sentinel roster and threshold ────────────────────────────
@@ -871,5 +1399,228 @@ impl KovaraIndex {
         }
 
         Ok(stored)
+    }
+
+    // ── CT-030..CT-033: storage, rounding, aggregation ────────────────────
+
+    /// Validate, store, and emit the event for one finalized record.
+    ///
+    /// Shared by [`Self::set_daily_index`] and
+    /// [`Self::set_daily_index_from_observations`] so the two entrypoints can
+    /// never diverge on what gets stored or emitted. Authorization must have
+    /// already been checked by the caller.
+    #[allow(clippy::too_many_arguments)]
+    fn store_index(
+        env: &Env,
+        schema_version: u32,
+        updater: &Address,
+        country: &Symbol,
+        date: u64,
+        value: i128,
+        basket_version: u32,
+        source_period_start: u64,
+        source_period_end: u64,
+    ) -> Result<(), Error> {
+        // Only the two fields CT-035 introduces were validated here before
+        // CT-030..CT-033 landed; country and date validation still belong to
+        // CT-004 and CT-005.
+        if basket_version == 0 {
+            return Err(Error::InvalidBasketVersion);
+        }
+
+        if source_period_end < source_period_start {
+            return Err(Error::InvalidSourcePeriod);
+        }
+
+        // The overflow rule (CT-031): a value beyond KVI_VALUE_MAX could
+        // wrap in downstream arithmetic; reject rather than store garbage.
+        if !(-KVI_VALUE_MAX..=KVI_VALUE_MAX).contains(&value) {
+            return Err(Error::ValueOutOfRange);
+        }
+
+        Self::require_not_finalized(env, schema_version, country, date)?;
+
+        let record = DailyIndex {
+            country: country.clone(),
+            date,
+            value,
+            basket_version,
+            source_period_start,
+            source_period_end,
+            updater: updater.clone(),
+            schema_version,
+        };
+
+        env.storage().persistent().set(
+            &DataKey::DailyIndex(schema_version, country.clone(), date),
+            &record,
+        );
+
+        // The CT-033 out-of-order check needs the latest date per country;
+        // keep it in the same write as the record so the two cannot diverge.
+        env.storage()
+            .persistent()
+            .set(&DataKey::LatestDate(schema_version, country.clone()), &date);
+
+        DailyIndexUpdated {
+            country: country.clone(),
+            date,
+            value,
+            basket_version,
+            source_period_start,
+            source_period_end,
+            updater: updater.clone(),
+            schema_version,
+        }
+        .publish(env);
+
+        Ok(())
+    }
+
+    /// The CT-033 immutable-history guard: reject duplicate and out-of-order
+    /// writes.
+    fn require_not_finalized(
+        env: &Env,
+        schema_version: u32,
+        country: &Symbol,
+        date: u64,
+    ) -> Result<(), Error> {
+        // A replay targets a date that already has a record.
+        if env.storage().persistent().has(&DataKey::DailyIndex(
+            schema_version,
+            country.clone(),
+            date,
+        )) {
+            return Err(Error::IndexAlreadyFinalized);
+        }
+
+        // Backdating targets a date earlier than the latest finalized one. A
+        // date *equal* to the latest can never reach here — it would have a
+        // record — but `<=` keeps the guard airtight.
+        if let Some(latest) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::LatestDate(schema_version, country.clone()))
+        {
+            if date <= latest {
+                return Err(Error::OutOfOrderUpdate);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The deterministic weighted trimmed median (CT-032).
+    fn aggregate(observations: &Vec<Observation>) -> Result<i128, Error> {
+        let count = observations.len();
+        if count == 0 {
+            return Err(Error::EmptyObservations);
+        }
+
+        for observation in observations.iter() {
+            if observation.weight == 0 {
+                return Err(Error::ZeroWeight);
+            }
+
+            // Bounds are enforced here too, not just at storage: the pure
+            // function must be total over its documented domain, and it
+            // keeps the median straddle sum (`a + b`) safely inside `i128`.
+            if !(-KVI_VALUE_MAX..=KVI_VALUE_MAX).contains(&observation.value) {
+                return Err(Error::ValueOutOfRange);
+            }
+        }
+
+        // Trim the lowest and highest `trim` observations by count. `trim` is
+        // `floor(count / 10)`, which is always less than `count / 2`, so at
+        // least one observation always remains.
+        let trim = (count * TRIMMING_PERCENT) / 100;
+
+        let mut sorted = observations.clone();
+        sort_by_value(&mut sorted);
+
+        let mut total_weight: u64 = 0;
+        for i in trim..(count - trim) {
+            total_weight += sorted.get(i).unwrap().weight as u64;
+        }
+
+        // Walk the sorted remainder until cumulative weight crosses half.
+        let mut cumulative: u64 = 0;
+        let mut i = trim;
+        while i < count - trim {
+            let observation = sorted.get(i).unwrap();
+            cumulative += observation.weight as u64;
+
+            if cumulative * 2 > total_weight {
+                // Strictly more than half the weight: this is the median.
+                return Ok(observation.value);
+            }
+
+            if cumulative * 2 == total_weight {
+                // Exactly half: the median straddles this and the next value.
+                // Average them, rounded half away from zero (CT-031).
+                return Ok(match sorted.get(i + 1) {
+                    Some(next) => round_half_away(observation.value + next.value, 2),
+                    None => observation.value,
+                });
+            }
+
+            i += 1;
+        }
+
+        // Unreachable: total_weight > 0, so cumulative must cross half.
+        Err(Error::EmptyObservations)
+    }
+}
+
+/// Round `numer / denom` half away from zero (CT-031).
+///
+/// The one rounding rule in the crate, and the only one consumers need to
+/// reproduce: `5 / 2 -> 3`, `-5 / 2 -> -3`. Ties (a remainder of exactly
+/// half) round away from zero, so the rule is symmetric and never biased
+/// toward either direction.
+///
+/// `denom` must be positive. `numer` is expected to be a sum of values
+/// bounded by [`KVI_VALUE_MAX`], so the arithmetic cannot overflow `i128`.
+fn round_half_away(numer: i128, denom: i128) -> i128 {
+    debug_assert!(denom > 0);
+
+    let quotient = numer / denom;
+    let remainder = numer % denom;
+
+    if remainder.abs() * 2 >= denom {
+        if numer >= 0 {
+            quotient + 1
+        } else {
+            quotient - 1
+        }
+    } else {
+        quotient
+    }
+}
+
+/// Sort observations ascending by value, in place.
+///
+/// Insertion sort: the observation lists a daily aggregation sees are small
+/// (bounded by what fits in one transaction), and this keeps the sort
+/// dependency-free and obviously deterministic. Equal values are
+/// interchangeable, so the sort needs no secondary key.
+fn sort_by_value(observations: &mut Vec<Observation>) {
+    let count = observations.len();
+
+    for i in 1..count {
+        let mut j = i;
+
+        while j > 0 {
+            let current = observations.get(j).unwrap();
+            let previous = observations.get(j - 1).unwrap();
+
+            if previous.value <= current.value {
+                break;
+            }
+
+            observations.set(j, previous);
+            observations.set(j - 1, current);
+            j -= 1;
+        }
     }
 }
